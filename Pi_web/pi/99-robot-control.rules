@@ -1,0 +1,13 @@
+# 爬墙机器人 PWM 权限：允许普通用户导出并配置 pwmchip0
+# 安装：sudo cp 99-robot-control.rules /etc/udev/rules.d/
+#       sudo udevadm control --reload-rules && sudo udevadm trigger
+# UART（/dev/ttyAMA0）不需要规则：把运行用户加入 dialout 组即可
+#       sudo usermod -aG dialout <用户名>   （重新登录生效）
+
+# 允许导出 PWM 通道
+ACTION=="add", SUBSYSTEM=="pwm", KERNEL=="pwmchip0", RUN+="/bin/chmod a+w /sys/class/pwm/pwmchip0/export"
+
+# 通道节点在 export 之后才出现；出现时放开配置权限
+# polarity 也必须放开：控制服务每次初始化都会显式写 polarity=normal 防残留
+# （当前靠用户 gpio 组成员身份也能写，但不应依赖隐式权限）
+ACTION=="add", SUBSYSTEM=="pwm", KERNEL=="pwm[0-9]*", RUN+="/bin/sh -c 'chmod a+w %S%p/period %S%p/duty_cycle %S%p/enable %S%p/polarity'"

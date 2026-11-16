@@ -1,0 +1,15 @@
+[Unit]
+Description=爬墙机器人相机服务（Gemini Pro 可见光/深度/红外三路流 + 拍照，端口 8009）
+After=multi-user.target
+
+[Service]
+Type=simple
+# 按实际解压路径修改下一行；venv-cam 是装了 opencv-python + numpy 的虚拟环境
+ExecStart=/home/fangtb02/Pi_web/venv-cam/bin/python /home/fangtb02/Pi_web/pi/camera_service.py
+Restart=on-failure
+RestartSec=3
+# 以普通用户运行；相机 USB 访问权限由 OrbbecSDK 自带 udev 规则放开（部署清单第 3 步）
+User=fangtb02
+
+[Install]
+WantedBy=multi-user.target

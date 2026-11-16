@@ -1,0 +1,16 @@
+[Unit]
+Description=爬墙机器人控制台网页（npm run dev，端口 5173）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 通过 login shell 启动，确保能找到 npm/node（无论用 apt 还是 nvm 装的 Node）
+ExecStart=/bin/bash -lc 'cd /home/fangtb02/Pi_web && exec npm run dev -- --hostname 0.0.0.0'
+# on-failure：崩溃（非零退出）自动拉起；网页「安全停止」走 process.exit(0) 干净退出，真正停住不复活
+Restart=on-failure
+RestartSec=3
+User=fangtb02
+
+[Install]
+WantedBy=multi-user.target

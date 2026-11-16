@@ -1,0 +1,470 @@
+import serial
+import struct
+import threading
+import time
+
+
+PORT = "/dev/ttyAMA0"
+BAUD = 115200
+
+COMM_SET_RPM = 8
+
+MOTOR_POLE_PAIRS = 7
+GEAR_RATIO = 10.0
+HITS_PER_OUTPUT_REV = 1.0
+
+START_ERPM = 6000
+
+RAMP_STEPS = 10
+RAMP_DELAY = 0.05
+
+KEEPALIVE_S = 0.3
+
+SERIAL_LOCK = threading.Lock()
+KEEPALIVE_ERPM = 0
+
+
+def crc16(data):
+    crc = 0
+
+    for byte in data:
+        crc ^= byte << 8
+
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+
+    return crc
+
+
+def make_packet(payload):
+    length = len(payload)
+
+    packet = bytearray()
+
+    if length <= 255:
+        packet.append(2)
+        packet.append(length)
+    else:
+        packet.append(3)
+        packet.append((length >> 8) & 0xFF)
+        packet.append(length & 0xFF)
+
+    packet.extend(payload)
+
+    crc = crc16(payload)
+
+    packet.append((crc >> 8) & 0xFF)
+    packet.append(crc & 0xFF)
+    packet.append(3)
+
+    return bytes(packet)
+
+
+def send_erpm(ser, erpm):
+    payload = bytearray()
+
+    payload.append(COMM_SET_RPM)
+    payload.extend(
+        struct.pack(">i", int(erpm))
+    )
+
+    with SERIAL_LOCK:
+        ser.write(
+            make_packet(payload)
+        )
+
+        ser.flush()
+
+
+def send_erpm_multiple(ser, erpm, count=3):
+    for _ in range(count):
+        send_erpm(ser, erpm)
+        time.sleep(0.05)
+
+
+def keepalive_loop(ser):
+    """后台线程：电机运行期间每 0.3 秒重发当前转速，防止 VESC 超时自停。"""
+    while True:
+        erpm = KEEPALIVE_ERPM
+
+        if erpm != 0:
+            try:
+                send_erpm(ser, erpm)
+            except Exception:
+                pass
+
+        time.sleep(KEEPALIVE_S)
+
+
+def hit_rate_to_erpm(hit_rate):
+    motor_rpm = (
+        hit_rate
+        * GEAR_RATIO
+        / HITS_PER_OUTPUT_REV
+    )
+
+    erpm = (
+        motor_rpm
+        * MOTOR_POLE_PAIRS
+    )
+
+    return int(erpm)
+
+
+def ramp_speed(ser, start_erpm, target_erpm):
+    if start_erpm == target_erpm:
+        send_erpm_multiple(
+            ser,
+            target_erpm
+        )
+        return
+
+    print(
+        f"Ramping: {start_erpm} -> "
+        f"{target_erpm} ERPM"
+    )
+
+    difference = (
+        target_erpm
+        - start_erpm
+    )
+
+    for step in range(
+        1,
+        RAMP_STEPS + 1
+    ):
+        erpm = int(
+            start_erpm
+            + difference
+            * step
+            / RAMP_STEPS
+        )
+
+        send_erpm(
+            ser,
+            erpm
+        )
+
+        time.sleep(
+            RAMP_DELAY
+        )
+
+    send_erpm_multiple(
+        ser,
+        target_erpm
+    )
+
+
+def stop_motor(ser):
+    global KEEPALIVE_ERPM
+
+    print()
+    print("STOPPING MOTOR")
+
+    KEEPALIVE_ERPM = 0
+
+    send_erpm_multiple(
+        ser,
+        0,
+        count=10
+    )
+
+    print("MOTOR STOPPED")
+
+
+def start_motor(
+    ser,
+    target_erpm
+):
+    print()
+    print("==============================")
+    print("STARTING MOTOR")
+    print("==============================")
+
+    print(
+        f"Startup ERPM: {START_ERPM}"
+    )
+
+    send_erpm_multiple(
+        ser,
+        START_ERPM,
+        count=5
+    )
+
+    time.sleep(0.5)
+
+    ramp_speed(
+        ser,
+        START_ERPM,
+        target_erpm
+    )
+
+    print(
+        f"Target ERPM: {target_erpm}"
+    )
+
+    print("Motor running.")
+
+
+def change_speed(
+    ser,
+    current_erpm,
+    target_erpm
+):
+    print()
+    print(
+        f"Changing speed: "
+        f"{current_erpm} -> "
+        f"{target_erpm} ERPM"
+    )
+
+    ramp_speed(
+        ser,
+        current_erpm,
+        target_erpm
+    )
+
+    print(
+        f"Target ERPM: {target_erpm}"
+    )
+
+
+def print_menu(
+    running,
+    current_erpm
+):
+    print()
+    print(
+        "================================"
+    )
+    print(
+        "MOTOR CONTROL V2"
+    )
+    print(
+        "================================"
+    )
+
+    if running:
+        print("Status: RUNNING")
+        print(
+            f"Target ERPM: {current_erpm}"
+        )
+    else:
+        print("Status: STOPPED")
+
+    print()
+    print("1 - 80 hits/min")
+    print("2 - 90 hits/min")
+    print("3 - 100 hits/min")
+    print("4 - Custom hit rate")
+    print("0 - STOP")
+    print("q - STOP and EXIT")
+
+    print(
+        "================================"
+    )
+
+
+def main():
+    global KEEPALIVE_ERPM
+
+    ser = None
+
+    running = False
+    current_erpm = 0
+
+    try:
+        print("Opening UART...")
+
+        ser = serial.Serial(
+            PORT,
+            BAUD,
+            bytesize=8,
+            parity=serial.PARITY_NONE,
+            stopbits=1,
+            timeout=0.1
+        )
+
+        time.sleep(0.5)
+
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+
+        send_erpm_multiple(
+            ser,
+            0,
+            count=5
+        )
+
+        print("UART connected.")
+        print("Motor initialized to STOP.")
+
+        threading.Thread(
+            target=keepalive_loop,
+            args=(ser,),
+            daemon=True
+        ).start()
+
+        while True:
+            print_menu(
+                running,
+                current_erpm
+            )
+
+            command = input(
+                "Command > "
+            ).strip().lower()
+
+            if command == "0":
+                stop_motor(ser)
+
+                running = False
+                current_erpm = 0
+
+                continue
+
+            if command == "q":
+                stop_motor(ser)
+                break
+
+            target_erpm = None
+
+            if command == "1":
+                hit_rate = 80.0
+
+                target_erpm = (
+                    hit_rate_to_erpm(
+                        hit_rate
+                    )
+                )
+            elif command == "2":
+                hit_rate = 90.0
+
+                target_erpm = (
+                    hit_rate_to_erpm(
+                        hit_rate
+                    )
+                )
+
+            elif command == "3":
+                hit_rate = 100.0
+
+                target_erpm = (
+                    hit_rate_to_erpm(
+                        hit_rate
+                    )
+                )
+
+            elif command == "4":
+                try:
+                    hit_rate = float(
+                        input(
+                            "Hit rate "
+                            "(60-120 hits/min) > "
+                        )
+                    )
+
+                except ValueError:
+                    print(
+                        "Invalid number."
+                    )
+                    continue
+
+                if (
+                    hit_rate < 60.0
+                    or hit_rate > 120.0
+                ):
+                    print(
+                        "Allowed range: "
+                        "60-120 hits/min."
+                    )
+                    continue
+
+                target_erpm = (
+                    hit_rate_to_erpm(
+                        hit_rate
+                    )
+                )
+
+            else:
+                print(
+                    "Unknown command."
+                )
+                continue
+
+            print(
+                f"Selected hit rate: "
+                f"{hit_rate:.1f} hits/min"
+            )
+
+            print(
+                f"Calculated ERPM: "
+                f"{target_erpm}"
+            )
+
+            if not running:
+                start_motor(
+                    ser,
+                    target_erpm
+                )
+
+            else:
+                change_speed(
+                    ser,
+                    current_erpm,
+                    target_erpm
+                )
+
+            KEEPALIVE_ERPM = target_erpm
+
+            running = True
+            current_erpm = target_erpm
+
+    except KeyboardInterrupt:
+        print()
+        print("Ctrl+C detected.")
+
+    except serial.SerialException as e:
+        print()
+        print(
+            f"UART error: {e}"
+        )
+
+    except Exception as e:
+        print()
+        print(
+            f"Program error: {e}"
+        )
+
+    finally:
+        KEEPALIVE_ERPM = 0
+
+        if ser is not None:
+            print()
+            print("FINAL SAFETY STOP")
+
+            try:
+                send_erpm_multiple(
+                    ser,
+                    0,
+                    count=10
+                )
+
+            except Exception:
+                pass
+
+            try:
+                ser.close()
+
+            except Exception:
+                pass
+
+        print("UART closed.")
+        print("Program finished.")
+
+
+if __name__ == "__main__":
+    main()

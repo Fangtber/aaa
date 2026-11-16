@@ -1,0 +1,16 @@
+[Unit]
+Description=爬墙机器人控制服务（风机 PWM + VESC 敲击）
+After=multi-user.target
+
+[Service]
+Type=simple
+# 按实际解压路径修改下一行
+ExecStart=/usr/bin/python3 /home/fangtb02/Pi_web/pi/robot_control_service.py
+# on-failure：崩溃（非零退出）自动拉起；网页「安全停止」走干净退出（exit 0），真正停住不复活
+Restart=on-failure
+RestartSec=2
+# 以普通用户运行；PWM 权限由 99-robot-control.rules 放开，UART 靠 dialout 组
+User=fangtb02
+
+[Install]
+WantedBy=multi-user.target

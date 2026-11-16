@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""爬墙机器人控制服务：网页控制台与硬件之间的桥。
+
+硬件：
+- 风机：sysfs PWM，pwmchip0 的 pwm2(GPIO18/M1) 与 pwm3(GPIO19/M3)，
+  两路同步输出，50Hz，脉宽 1000~1700us（1000us = 停）。
+  注意：GPIO13 在 RP1 上没有 PWM 功能（实测 pinctrl 确认），M3 必须用 GPIO19。
+  软启动/软停止：启动、调速、日常停止走斜坡线程（每 50ms 步进 44µs），
+  急停（/safe-stop）与进程退出清理仍瞬时归零，绝不被斜坡拖延。
+- 敲击：VESC 电调走 UART /dev/ttyAMA0 @115200，COMM_SET_RPM 指令。
+  电机 7 对极、10:1 减速、输出轴每转敲击 1 次。
+
+敲击挡位定义（与网页控制台约定）：
+  5 个挡位，挡位越高敲击越快；点某挡后以该挡速度持续转动，随点随动。
+  运行中换挡直接跳变（电调自行平滑，软件不加渐变），停止则刹车。
+  挡位表存敲击频率（次/分，输出轴效果），发指令前换算：
+  ERPM = 敲击频率 x 10（减速比）x 7（极对数），即 频率 x 70。
+    1 档  60 次/分   4200 ERPM
+    2 档  70 次/分   4900 ERPM
+    3 档 100 次/分   7000 ERPM
+    4 档 120 次/分   8400 ERPM
+    5 档 150 次/分  10500 ERPM
+
+HTTP JSON API（默认 0.0.0.0:8008，CORS 放开，仅供热点内网使用）：
+  GET  /status
+  POST /fan/start  {"pwm": 0-100}
+  POST /fan/stop
+  POST /tap/gear  {"gear": 1-5}
+  POST /tap/stop
+  POST /safe-stop   风机归零 + 敲击停止，随后服务自退出（等效 Ctrl+C）
+
+首次接电流程：服务启动后即输出 1000us 最低油门，之后再给电调接动力电池。
+"""
+
+import json
+import signal
+import struct
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+# ---------------- 风机（sysfs PWM） ----------------
+
+PWM_CHIP = Path("/sys/class/pwm/pwmchip0")
+CHANNELS = (2, 3)  # GPIO18->pwm2/M1；GPIO19->pwm3/M3
+PERIOD_NS = 20_000_000  # 50Hz
+STOP_PULSE_US = 1000
+MIN_PULSE_US = 1000
+MAX_PULSE_US = 1700
+# 软启动/软停止斜坡：每 50ms 步进 44µs，1000→1434µs（62%）约 0.5 秒平滑到位。
+# 只作用于日常启动/调速/停止；急停（safe-stop）与进程退出仍是瞬时归零。
+RAMP_STEP_US = 44
+RAMP_INTERVAL_S = 0.05
+
+# ---------------- 敲击（VESC UART） ----------------
+
+VESC_PORT = "/dev/ttyAMA0"
+VESC_BAUD = 115200
+COMM_SET_RPM = 8
+
+MOTOR_POLE_PAIRS = 7
+GEAR_RATIO = 10.0
+HITS_PER_OUTPUT_REV = 1.0
+
+START_ERPM = 6000
+RAMP_STEPS = 10
+RAMP_DELAY = 0.05
+
+# 挡位表：挡位号 1~5 -> 敲击频率（次/分）；ERPM = 频率 x 70（10 减速比 x 7 对极）
+GEAR_RATES = {1: 60.0, 2: 70.0, 3: 100.0, 4: 120.0, 5: 150.0}
+TAP_REFRESH_S = 0.3
+
+HTTP_HOST = "0.0.0.0"
+HTTP_PORT = 8008
+
+START_TIME = time.monotonic()
+
+
+def log(message: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def hit_rate_to_erpm(hit_rate: float) -> int:
+    motor_rpm = hit_rate * GEAR_RATIO / HITS_PER_OUTPUT_REV
+    return int(motor_rpm * MOTOR_POLE_PAIRS)
+
+
+# ---------------- VESC 协议 ----------------
+
+
+def crc16(data) -> int:
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def make_packet(payload: bytes) -> bytes:
+    packet = bytearray()
+    length = len(payload)
+    if length <= 255:
+        packet.append(2)
+        packet.append(length)
+    else:
+        packet.append(3)
+        packet.append((length >> 8) & 0xFF)
+        packet.append(length & 0xFF)
+    packet.extend(payload)
+    crc = crc16(payload)
+    packet.append((crc >> 8) & 0xFF)
+    packet.append(crc & 0xFF)
+    packet.append(3)
+    return bytes(packet)
+
+
+class Vesc:
+    """VESC 串口连接；不可用时保持 unavailable，后续命令自动重试。"""
+
+    def __init__(self) -> None:
+        self._ser = None
+        self._lock = threading.Lock()
+        self._last_error: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return self._ser is not None
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
+
+    def connect(self) -> bool:
+        if self._ser is not None:
+            return True
+        if serial is None:
+            self._last_error = "未安装 pyserial（pip install pyserial）"
+            return False
+        try:
+            self._ser = serial.Serial(
+                VESC_PORT,
+                VESC_BAUD,
+                bytesize=8,
+                parity=serial.PARITY_NONE,
+                stopbits=1,
+                timeout=0.1,
+            )
+            time.sleep(0.5)
+            self._ser.reset_input_buffer()
+            self._ser.reset_output_buffer()
+            self._send_erpm_locked(0)
+            self._last_error = None
+            log(f"VESC 串口已连接：{VESC_PORT}")
+            return True
+        except Exception as exc:  # noqa: BLE001 - 任何串口错误都按不可用处理
+            self._ser = None
+            self._last_error = str(exc)
+            return False
+
+    def send_erpm(self, erpm: int) -> None:
+        with self._lock:
+            self._send_erpm_locked(erpm)
+
+    def _send_erpm_locked(self, erpm: int) -> None:
+        if self._ser is None:
+            raise RuntimeError("VESC 串口未连接")
+        payload = bytearray()
+        payload.append(COMM_SET_RPM)
+        payload.extend(struct.pack(">i", int(erpm)))
+        try:
+            self._ser.write(make_packet(payload))
+            self._ser.flush()
+        except Exception as exc:  # noqa: BLE001
+            self._ser = None
+            self._last_error = str(exc)
+            raise RuntimeError(f"VESC 串口写入失败：{exc}") from exc
+
+    def send_erpm_multiple(self, erpm: int, count: int = 3) -> None:
+        for _ in range(count):
+            self.send_erpm(erpm)
+            time.sleep(0.05)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._ser is None:
+                return
+            try:
+                ser = self._ser
+                payload = bytearray([COMM_SET_RPM])
+                payload.extend(struct.pack(">i", 0))
+                for _ in range(10):
+                    ser.write(make_packet(payload))
+                    ser.flush()
+                    time.sleep(0.05)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._ser.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._ser = None
+
+
+# ---------------- 风机控制器 ----------------
+
+
+class FanController:
+    def __init__(self) -> None:
+        self.available = False
+        self._last_error: str | None = None
+        self._configured: set[int] = set()
+        self._lock = threading.Lock()
+        self.pwm = 0
+        self.pulse_us = STOP_PULSE_US
+        # 斜坡控制：目标值由 set_pwm/request_stop 维护，后台线程逐步逼近；
+        # _current_pulse_us 跟踪实际写到硬件的脉宽
+        self._target_pulse_us = STOP_PULSE_US
+        self._current_pulse_us = STOP_PULSE_US
+        self._ramp_thread: threading.Thread | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.pwm > 0
+
+    @property
+    def last_error(self) -> str | None:
+        return self._last_error
+
+    @staticmethod
+    def _write(path: Path, value: int | str) -> None:
+        path.write_text(str(value), encoding="ascii")
+
+    def _configure_with_retry(self, node: Path, attempts: int = 10) -> None:
+        """配置单个通道；udev 权限放开有延迟，EACCES 时短暂重试。
+
+        显式写 polarity=normal：sysfs 状态跨进程存活，一旦以前被改成
+        inversed 会一直残留，1000us 会被反相成 19ms 高电平（大油门）。
+        """
+        for attempt in range(attempts):
+            try:
+                try:
+                    self._write(node / "enable", 0)
+                except OSError:
+                    pass
+                self._write(node / "polarity", "normal")
+                self._write(node / "period", PERIOD_NS)
+                self._write(node / "duty_cycle", STOP_PULSE_US * 1000)
+                self._write(node / "enable", 1)
+                # 读回校验：极性/占空比不对立刻报错，绝不让异常信号出门
+                if (node / "polarity").read_text().strip() != "normal":
+                    raise RuntimeError(f"{node.name} polarity 读回异常")
+                try:
+                    duty_ns = int((node / "duty_cycle").read_text().strip())
+                except ValueError as exc:
+                    raise RuntimeError(f"{node.name} duty_cycle 读回异常") from exc
+                if duty_ns != STOP_PULSE_US * 1000:
+                    raise RuntimeError(f"{node.name} duty_cycle 读回异常：{duty_ns}")
+                return
+            except PermissionError:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(0.1)
+
+    def _setup(self) -> bool:
+        if self.available:
+            return True
+        try:
+            if not PWM_CHIP.exists():
+                raise RuntimeError(
+                    "未找到 pwmchip0，请先执行 sudo dtoverlay pwm-2chan pin=18 pin2=19"
+                )
+            npwm = int((PWM_CHIP / "npwm").read_text().strip())
+            if max(CHANNELS) >= npwm:
+                raise RuntimeError(f"当前只有 {npwm} 个 PWM 通道，需要 pwm2 和 pwm3")
+            for channel in CHANNELS:
+                node = PWM_CHIP / f"pwm{channel}"
+                if not node.exists():
+                    self._write(PWM_CHIP / "export", channel)
+                    deadline = time.monotonic() + 2.0
+                    while not node.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    if not node.exists():
+                        raise RuntimeError(f"等待 PWM 节点超时：{node}")
+                    # udev 异步放开权限，刚导出的节点需要等它一步
+                    time.sleep(0.15)
+                self._configure_with_retry(node)
+                self._configured.add(channel)
+            self.available = True
+            self._last_error = None
+            self._current_pulse_us = STOP_PULSE_US  # 初始化刚写过 1000us
+            log("风机 PWM 初始化完成（1000us 最低油门）")
+            return True
+        except (OSError, RuntimeError) as exc:
+            self.available = False
+            self._last_error = str(exc)
+            return False
+
+    def set_pwm(self, pwm: int) -> None:
+        """设目标 PWM；实际脉宽由斜坡线程平滑逼近，不直接阶跃写入。"""
+        if not 0 <= pwm <= 100:
+            raise ValueError("pwm 必须在 0~100 之间")
+        with self._lock:
+            if not self._setup():
+                raise RuntimeError(f"PWM 不可用：{self._last_error}")
+            pulse_us = STOP_PULSE_US if pwm == 0 else MIN_PULSE_US + round(
+                pwm * (MAX_PULSE_US - MIN_PULSE_US) / 100
+            )
+            self._target_pulse_us = pulse_us
+            self.pwm = pwm
+            self.pulse_us = pulse_us  # 对外语义为目标脉宽
+            self._ensure_ramp_thread()
+
+    def request_stop(self) -> None:
+        """日常停止（网页「停止并归零」）：目标设回 1000us，斜坡线程平滑降回。
+
+        急停不要用这个方法——stop() 才是瞬时归零。
+        """
+        with self._lock:
+            self._target_pulse_us = STOP_PULSE_US
+            self.pwm = 0
+            self.pulse_us = STOP_PULSE_US
+            if self.available:
+                self._ensure_ramp_thread()
+
+    def _ensure_ramp_thread(self) -> None:
+        """确保斜坡线程在跑（须在 _lock 内调用；daemon 线程，只创建一次）。"""
+        if self._ramp_thread is not None and self._ramp_thread.is_alive():
+            return
+        self._ramp_thread = threading.Thread(
+            target=self._ramp_loop, daemon=True, name="fan-ramp")
+        self._ramp_thread.start()
+
+    def _ramp_loop(self) -> None:
+        """斜坡执行体：每 50ms 把实际脉宽向目标值步进 44µs。
+
+        只写 duty_cycle。stop() 的瞬时归零会同时把目标改为 STOP 并直接写
+        duty，斜坡线程随之收敛，不会出现"急停后被斜坡拉回去"的对抗。
+        写入失败只告警不杀线程（5 秒节流，防刷屏），目标仍在，下一轮继续尝试。
+        """
+        last_warn = 0.0
+        while True:
+            with self._lock:
+                target = self._target_pulse_us
+                current = self._current_pulse_us
+                if target != current and self.available:
+                    step = min(RAMP_STEP_US, abs(target - current))
+                    nxt = current + step if target > current else current - step
+                    try:
+                        for channel in CHANNELS:
+                            self._write(PWM_CHIP / f"pwm{channel}" / "duty_cycle", nxt * 1000)
+                        self._current_pulse_us = nxt
+                        if nxt == target:
+                            log(f"风机脉宽已到目标 {target}us")
+                    except Exception as exc:  # noqa: BLE001 - 硬件错误不能杀死斜坡线程
+                        now = time.monotonic()
+                        if now - last_warn > 5.0:
+                            last_warn = now
+                            log(f"[警告] 风机斜坡写入失败：{exc}")
+            time.sleep(RAMP_INTERVAL_S)
+
+    def stop(self) -> None:
+        """瞬时归零（急停/进程退出用）：立即写 1000us，不走斜坡。"""
+        with self._lock:
+            self._target_pulse_us = STOP_PULSE_US  # 先改目标，斜坡线程不会把输出拉回去
+            if not self.available:
+                self.pwm = 0
+                self.pulse_us = STOP_PULSE_US
+                self._current_pulse_us = STOP_PULSE_US
+                return
+            for channel in tuple(self._configured):
+                duty_file = PWM_CHIP / f"pwm{channel}" / "duty_cycle"
+                if duty_file.exists():
+                    try:
+                        self._write(duty_file, STOP_PULSE_US * 1000)
+                    except OSError:
+                        pass
+            self._current_pulse_us = STOP_PULSE_US
+            self.pwm = 0
+            self.pulse_us = STOP_PULSE_US
+
+    def shutdown(self) -> None:
+        self.stop()
+        time.sleep(0.3)
+        for channel in tuple(self._configured):
+            enable_file = PWM_CHIP / f"pwm{channel}" / "enable"
+            if enable_file.exists():
+                try:
+                    self._write(enable_file, 0)
+                except OSError:
+                    pass
+        self._configured.clear()
+        self.available = False
+
+
+# ---------------- 敲击引擎 ----------------
+
+
+class TapEngine(threading.Thread):
+    """独立线程执行敲击动作；HTTP 线程只改 desired 挡位（0 = 停，1~5 = 挡位）。"""
+
+    def __init__(self, vesc: Vesc) -> None:
+        super().__init__(daemon=True, name="tap-engine")
+        self.vesc = vesc
+        self._lock = threading.Lock()
+        self._desired = 0
+        self.current = "idle"  # "idle" | "running"
+        self.gear: int | None = None
+        self.hits_per_min: float | None = None
+        self._spinning = False
+        self._current_erpm = 0
+        self._stop_event = threading.Event()
+
+    def set_desired(self, gear: int) -> None:
+        with self._lock:
+            self._desired = gear
+
+    def get_desired(self) -> int:
+        with self._lock:
+            return self._desired
+
+    def stop_thread(self) -> None:
+        self._stop_event.set()
+        self.set_desired(0)
+
+    def _ramp(self, start_erpm: int, target_erpm: int) -> None:
+        if start_erpm == target_erpm:
+            self.vesc.send_erpm_multiple(target_erpm)
+            return
+        difference = target_erpm - start_erpm
+        for step in range(1, RAMP_STEPS + 1):
+            if self._stop_event.is_set():
+                return
+            self.vesc.send_erpm(int(start_erpm + difference * step / RAMP_STEPS))
+            time.sleep(RAMP_DELAY)
+        self.vesc.send_erpm_multiple(target_erpm)
+
+    def _ensure_spinning(self, target_erpm: int) -> None:
+        if not self._spinning:
+            self.vesc.send_erpm_multiple(START_ERPM, count=5)
+            time.sleep(0.5)
+            self._ramp(START_ERPM, target_erpm)
+            self._spinning = True
+            self._current_erpm = target_erpm
+        elif self._current_erpm != target_erpm:
+            # 运行中换挡：直接跳变到目标 ERPM，软件不加渐变（电调自行平滑）
+            self.vesc.send_erpm_multiple(target_erpm)
+            self._current_erpm = target_erpm
+
+    def _brake(self) -> None:
+        try:
+            self.vesc.send_erpm_multiple(0, count=10)
+        finally:
+            self._spinning = False
+            self._current_erpm = 0
+
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            desired = self.get_desired()
+            try:
+                if desired not in GEAR_RATES:
+                    if self._spinning or self.current != "idle":
+                        if self._spinning:
+                            self._brake()
+                        self.current = "idle"
+                        self.gear = None
+                        self.hits_per_min = None
+                        log("敲击装置已停止")
+                    time.sleep(0.05)
+                else:
+                    rate = GEAR_RATES[desired]
+                    if self.current != "running" or self.gear != desired:
+                        log(f"敲击换挡：{desired} 档（{rate:.0f} 次/分，{hit_rate_to_erpm(rate)} ERPM）")
+                    self.current = "running"
+                    self.gear = desired
+                    self.hits_per_min = rate
+                    self._ensure_spinning(hit_rate_to_erpm(rate))
+                    self.vesc.send_erpm(self._current_erpm)  # 周期刷新，防看门狗
+                    time.sleep(TAP_REFRESH_S)
+            except Exception as exc:  # noqa: BLE001 - 硬件错误不能杀死引擎线程
+                log(f"[错误] 敲击引擎：{exc}")
+                self.current = "idle"
+                self.gear = None
+                self.hits_per_min = None
+                self._spinning = False
+                self._current_erpm = 0
+                self.set_desired(0)
+                time.sleep(0.5)
+
+
+# ---------------- HTTP API ----------------
+
+fan = FanController()
+vesc = Vesc()
+tap_engine = TapEngine(vesc)
+
+
+def status_dict() -> dict:
+    return {
+        "ok": True,
+        "hardware": {"pwm": fan.available, "uart": vesc.available},
+        "hardware_error": {"pwm": fan.last_error, "uart": vesc.last_error},
+        "fan": {
+            "running": fan.running,
+            "pwm": fan.pwm,
+            "pulse_us": fan.pulse_us,
+        },
+        "tap": {"state": tap_engine.current, "gear": tap_engine.gear, "hits_per_min": tap_engine.hits_per_min},
+        "uptime_s": int(time.monotonic() - START_TIME),
+    }
+
+
+def require_uart() -> None:
+    if not vesc.available and not vesc.connect():
+        raise RuntimeError(f"敲击装置 UART 不可用：{vesc.last_error}")
+
+
+def handle_command(path: str, body: dict) -> dict:
+    if path == "/fan/start":
+        raw_pwm = body.get("pwm", 0)
+        if isinstance(raw_pwm, bool) or not isinstance(raw_pwm, (int, float)):
+            raise ValueError("pwm 必须是 0~100 的数字")
+        pwm = int(raw_pwm)
+        if pwm <= 0:
+            raise ValueError("pwm 为 0，请先设置转速")
+        fan.set_pwm(pwm)
+        log(f"风机启动：PWM {pwm}%（{fan.pulse_us}us，M1/M3 同步）")
+    elif path == "/fan/stop":
+        fan.request_stop()
+        log("风机停止：斜坡降回 1000us（急停请用 /safe-stop）")
+    elif path == "/tap/gear":
+        gear = body.get("gear")
+        if isinstance(gear, bool) or not isinstance(gear, int) or gear not in GEAR_RATES:
+            raise ValueError("gear 必须是 1~5 的整数")
+        require_uart()
+        tap_engine.set_desired(gear)
+        log(f"敲击指令：{gear} 档（{GEAR_RATES[gear]:.0f} 次/分）")
+    elif path == "/tap/stop":
+        tap_engine.set_desired(0)
+    elif path == "/safe-stop":
+        fan.stop()
+        tap_engine.set_desired(0)
+        log("安全停止已执行（风机归零 + 敲击停止），控制服务即将退出")
+    else:
+        raise KeyError(f"未知路径：{path}")
+    return {"ok": True, "state": status_dict()}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "RobotControl/1.0"
+
+    def _send_json(self, code: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 - http.server 固定命名
+        # 204 按规范不能带响应体（与 camera_service 保持一致）：只回头部不写 body
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/status":
+            self._send_json(200, status_dict())
+        else:
+            self._send_json(404, {"ok": False, "error": "未知路径"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            body = json.loads(raw.decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("请求体必须是 JSON 对象")
+            result = handle_command(self.path, body)
+            self._send_json(200, result)
+            if self.path == "/safe-stop":
+                # 响应送达后退出进程，等效终端里按 Ctrl+C：
+                # server.shutdown() 结束 serve_forever，main 的 finally 走完整清理
+                threading.Thread(target=self._quit_soon, daemon=True, name="safe-stop-quit").start()
+        except KeyError as exc:
+            self._send_json(404, {"ok": False, "error": str(exc)})
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._send_json(400, {"ok": False, "error": str(exc)})
+        except RuntimeError as exc:
+            self._send_json(503, {"ok": False, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(500, {"ok": False, "error": f"服务内部错误：{exc}"})
+
+    def _quit_soon(self) -> None:
+        time.sleep(0.5)  # 先让 HTTP 响应完整发回浏览器
+        log("控制服务正在退出（等效 Ctrl+C）……")
+        self.server.shutdown()
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        log(f"HTTP {self.address_string()} {format % args}")
+
+
+# ---------------- 启动与退出 ----------------
+
+
+def shutdown(signum=None, frame=None) -> None:  # noqa: ARG001
+    log("正在安全停机……")
+    tap_engine.stop_thread()
+    tap_engine.join(timeout=5)
+    try:
+        vesc.close()
+    except Exception:  # noqa: BLE001
+        pass
+    fan.shutdown()
+    log("已停机。")
+
+
+def main() -> int:
+    signal.signal(signal.SIGINT, lambda s, f: (_ for _ in ()).throw(SystemExit(0)))
+    signal.signal(signal.SIGTERM, lambda s, f: (_ for _ in ()).throw(SystemExit(0)))
+
+    tap_engine.start()
+    fan._setup()  # 启动即输出 1000us 最低油门；失败不致命，后续命令自动重试
+    if vesc.connect():
+        log("VESC 已就绪")
+    else:
+        log(f"[警告] VESC 暂不可用：{vesc.last_error}（将在收到敲击命令时重试）")
+
+    server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
+    log(f"控制服务已启动：http://{HTTP_HOST}:{HTTP_PORT}")
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
